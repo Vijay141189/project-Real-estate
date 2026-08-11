@@ -1,0 +1,159 @@
+name: Terraform CI/CD - Azure Landing Zone
+
+on:
+  push:
+    branches: [main, feature/*]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Environment to apply (used only for manual runs)"
+        required: false
+        default: "dev"
+        type: choice
+        options: [dev, test, prod]
+
+env:
+  ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+  ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+  ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+  ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+
+jobs:
+  lint:
+    name: TFLint (${{ matrix.environment }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        environment: [dev, test, prod]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: latest
+      - name: Run TFLint
+        working-directory: environment/${{ matrix.environment }}
+        run: |
+          tflint --init
+          tflint --minimum-failure-severity=error
+
+  security-scan:
+    name: TFSec (${{ matrix.environment }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        environment: [dev, test, prod]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run tfsec
+        uses: aquasecurity/tfsec-action@v1.0.3
+        with:
+          working_directory: environment/${{ matrix.environment }}
+          soft_fail: false
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+  secret-scan:
+    name: TruffleHog
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Run TruffleHog
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          extra_args: --only-verified
+
+  terraform-plan:
+    name: Terraform Plan (${{ matrix.environment }})
+    runs-on: ubuntu-latest
+    needs: [lint, security-scan, secret-scan]
+    strategy:
+      matrix:
+        environment: [dev, test, prod]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - name: Terraform Init
+        working-directory: environment/${{ matrix.environment }}
+        run: terraform init
+      - name: Terraform Validate
+        working-directory: environment/${{ matrix.environment }}
+        run: terraform validate
+      - name: Terraform Plan
+        working-directory: environment/${{ matrix.environment }}
+        run: terraform plan -input=false -out=tfplan
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ matrix.environment }}
+          path: environment/${{ matrix.environment }}/tfplan
+
+  # Dev: auto-apply on every push to main (fast feedback, low risk environment)
+  terraform-apply-dev:
+    name: Terraform Apply (dev)
+    runs-on: ubuntu-latest
+    needs: terraform-plan
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - name: Terraform Init
+        working-directory: environment/dev
+        run: terraform init
+      - name: Download plan artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-dev
+          path: environment/dev
+      - name: Terraform Apply
+        working-directory: environment/dev
+        run: terraform apply -input=false -auto-approve tfplan
+
+  # Test: auto-apply on push to main as well, mirrors dev risk profile
+  terraform-apply-test:
+    name: Terraform Apply (test)
+    runs-on: ubuntu-latest
+    needs: terraform-plan
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - name: Terraform Init
+        working-directory: environment/test
+        run: terraform init
+      - name: Download plan artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-test
+          path: environment/test
+      - name: Terraform Apply
+        working-directory: environment/test
+        run: terraform apply -input=false -auto-approve tfplan
+
+  # Prod: needs manual approval — configure required reviewers on the "production"
+  # environment in GitHub repo Settings > Environments so this job pauses for sign-off.
+  terraform-apply-prod:
+    name: Terraform Apply (prod)
+    runs-on: ubuntu-latest
+    needs: terraform-plan
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - name: Terraform Init
+        working-directory: environment/prod
+        run: terraform init
+      - name: Download plan artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-prod
+          path: environment/prod
+      - name: Terraform Apply
+        working-directory: environment/prod
+        run: terraform apply -input=false -auto-approve tfplan
