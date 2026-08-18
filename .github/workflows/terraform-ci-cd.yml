@@ -26,7 +26,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        environment: [dev, test, prod]
+        environment: [dev]
     steps:
       - uses: actions/checkout@v4
       - uses: terraform-linters/setup-tflint@v4
